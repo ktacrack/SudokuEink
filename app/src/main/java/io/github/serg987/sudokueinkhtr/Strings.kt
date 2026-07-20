@@ -71,6 +71,7 @@ interface Strings {
     val settings: String
     val zenMode: String
     val zenModeDescription: String
+    val refreshModeWarning: String
 
     // Game
     val back: String
@@ -220,6 +221,7 @@ object StringsCa : Strings {
     override val createdBy = "Creada per ktacrack"
     override val zenMode = "Mode Zen (Sense cronòmetre)"
     override val zenModeDescription = "Sense cronòmetre"
+    override val refreshModeWarning = "El dispositiu no està en el mode d'actualització de pantalla Normal — l'entrada amb llapis pot causar bloquejos visibles de la interfície. Es recomana canviar al mode Normal."
 
     override val back = "← Tornar"
     override val newGame = "Nou Joc"
@@ -360,6 +362,7 @@ object StringsEs : Strings {
     override val createdBy = "Creada por ktacrack"
     override val zenMode = "Modo Zen (Sin cronómetro)"
     override val zenModeDescription = "Sin cronómetro"
+    override val refreshModeWarning = "El dispositivo no está en el modo de actualización de pantalla Normal — la entrada con lápiz puede causar bloqueos visibles de la interfaz. Se recomienda cambiar al modo Normal."
 
     override val back = "← Volver"
     override val newGame = "Nuevo Juego"
@@ -502,6 +505,7 @@ object StringsEn : Strings {
     override val createdBy = "Created by ktacrack"
     override val zenMode = "Zen Mode (No timer)"
     override val zenModeDescription = "No timer"
+    override val refreshModeWarning = "The device is not in Normal screen refresh mode — pen input may cause visible UI hangs or freezes. Switching to Normal mode is recommended."
 
     override val back = "← Back"
     override val newGame = "New Game"

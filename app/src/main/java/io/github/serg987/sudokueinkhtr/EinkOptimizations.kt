@@ -29,6 +29,31 @@ object EinkOptimizations {
         }
     }
 
+    /**
+     * True on an Onyx device whose per-app E-ink refresh mode is anything other than
+     * Normal (Speed/A2/X/Regal). Only Normal-mode sessions are known clean against the
+     * EPD-driver freeze the fast modes can trigger during pen use, so the UI shows a
+     * warning whenever this returns true.
+     *
+     * The mode is the E-ink-center per-app setting and can change mid-session via the
+     * floating ball — re-check on every resume, not once at startup. Device-verified
+     * mapping (Boox Max3): Normal=NORMAL, Regal=REGAL, Speed=FAST_QUALITY, A2=FAST,
+     * X=FAST_X. On non-Onyx devices (or if the hidden framework getter is missing and
+     * the SDK falls back) this stays false — a hidden warning is the safe failure mode.
+     */
+    fun isNonNormalRefreshMode(): Boolean {
+        val onyx = android.os.Build.MANUFACTURER.equals("ONYX", ignoreCase = true) ||
+            android.os.Build.BRAND.equals("ONYX", ignoreCase = true)
+        if (!onyx) return false
+        return try {
+            val mode = com.onyx.android.sdk.api.device.epd.EpdController.getAppScopeRefreshMode()
+                ?: return false
+            mode != com.onyx.android.sdk.api.device.epd.UpdateOption.NORMAL
+        } catch (t: Throwable) {
+            false
+        }
+    }
+
     // Optimització específica per Onyx Boox
     fun setOnyxRefreshMode(window: Window, mode: Int) {
         try {

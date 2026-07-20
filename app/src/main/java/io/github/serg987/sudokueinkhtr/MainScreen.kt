@@ -35,6 +35,20 @@ fun MainScreen(
     val scale = AdaptiveSizes.getScaleFactor()
     var showAlreadyPlayedDialog by remember { mutableStateOf(false) }
 
+    // The E-ink-center per-app refresh mode can change while the app is backgrounded
+    // (floating ball), so re-read it on every resume rather than once per composition.
+    var showRefreshModeWarning by remember { mutableStateOf(EinkOptimizations.isNonNormalRefreshMode()) }
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                showRefreshModeWarning = EinkOptimizations.isNonNormalRefreshMode()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     key(currentLanguage, isDarkTheme) {
         val strings = when (currentLanguage) {
             Language.CATALAN -> StringsCa
@@ -291,17 +305,40 @@ fun MainScreen(
                     }
                 }
 
-                // ✅ TEXT "CREATED BY" (sempre baix)
-                Text(
-                    text = "Original app by ktacrack. Fork, HTR and UI modifications by serg987.",
-                    fontSize = (20 * scale).sp,
-                    fontStyle = FontStyle.Italic,
-                    color = Color.Black,
+                // ✅ Bottom strip: optional refresh-mode warning above the "created by" line
+                Column(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .windowInsetsPadding(WindowInsets.navigationBars)
-                        .padding(bottom = (8 * scale).dp)
-                )
+                        .padding(bottom = (8 * scale).dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    if (showRefreshModeWarning) {
+                        // Styled like the menu buttons for visual consistency, but static —
+                        // informational only, no click action.
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth(0.8f)
+                                .border(BorderStroke((2 * scale).dp, Color.Black), RoundedCornerShape((16 * scale).dp))
+                                .padding(horizontal = (16 * scale).dp, vertical = (12 * scale).dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = strings.refreshModeWarning,
+                                fontSize = (19 * scale).sp,
+                                color = Color.Black,
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                            )
+                        }
+                        Spacer(modifier = Modifier.height((12 * scale).dp))
+                    }
+                    Text(
+                        text = "Original app by ktacrack. Fork, HTR and UI modifications by serg987.",
+                        fontSize = (20 * scale).sp,
+                        fontStyle = FontStyle.Italic,
+                        color = Color.Black
+                    )
+                }
 
         }
     }
