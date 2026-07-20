@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Changed
+- **Raw-ink flush pipeline rewritten** to stop toggling `TouchHelper.setRawDrawingEnabled`
+  when clearing handwritten ink. That toggle loses the next stroke's ink start (lazy
+  scribble-mode re-entry) and is a confirmed EPD-driver freeze trigger on Onyx devices
+  under sustained pen use. Ink is now cleared via a repaint bracket
+  (`EpdController.enablePost` + `HAND_WRITING_REPAINT_MODE`, ported from NonogramEink's
+  freeze investigation and precedented in Onyx's own SDK demos), gated so it never runs
+  while the pen is physically down. `RawInputCallback` methods now do only trivial work on
+  the Onyx SDK's background thread; all app-state updates are posted to the main thread.
+- **Game timer display holds steady while the pen is active** (pen-down through the
+  trailing ink flush, roughly per digit written) instead of recomposing every second
+  regardless — a periodic recomposition racing a pen-down could eat the wet ink of the
+  digit currently being written. Elapsed-time accounting itself never stops or drifts;
+  only the visible text pauses, then jumps to the correct value once the pen lifts.
+- **Main menu warns when the Onyx E-ink refresh mode isn't Normal** (Speed/A2/X/Regal),
+  since only Normal-mode sessions are verified clean against the freeze above. Re-checked
+  on every window-focus regain, so switching modes via the system E-ink center modal
+  updates the banner without leaving the app.
+
 ## [0.1.0] - 2026-06-25
 
 This is the first release of the **Sudoku E-Ink HTR** fork. This project was forked from [SudokuEink by ktacrack](https://github.com/ktacrack/SudokuEink) at version 1.5.1.

@@ -184,11 +184,20 @@ fun GameScreen(
         }
     }
 
+    // Shared with both InlineDrawingCanvas instances (portrait/landscape) below: true from
+    // pen-down through the trailing ink flush (~1.5s per digit). The timer display holds
+    // steady while true so its periodic recomposition can't race a pen-down and eat the
+    // wet ink of the digit currently being written (EPD refreshes racing a pen-down can
+    // eat that stroke's ink — see AGENTS.md). The elapsed-time accounting itself never
+    // stops; only the displayed text is held, then jumps to the correct value on release.
+    val penActiveState = remember { mutableStateOf(false) }
+
     val timerText = rememberTimer(
         resetTrigger = resetTrigger,
         startOffset = startTimeOffset,
         isPaused = isPaused || isZenMode,  // ✅ Pausar timer si Mode Zen
         resetTimer = resetTimerTrigger,
+        holdDisplay = penActiveState.value,
         onTimeUpdate = { elapsedSeconds ->
             currentElapsedSeconds = elapsedSeconds
         }
@@ -792,7 +801,8 @@ fun GameScreen(
                                     }
                                 },
                                 isCellFilledWithPencil = { r, c -> boardState[r][c].isPencil && boardState[r][c].value != 0 },
-                                isCellFixed = { r, c -> boardState[r][c].isFixed }
+                                isCellFixed = { r, c -> boardState[r][c].isFixed },
+                                penActiveState = penActiveState
                             )
                         }
                     }
@@ -1310,7 +1320,8 @@ fun GameScreen(
                             }
                         },
                         isCellFilledWithPencil = { r, c -> boardState[r][c].isPencil && boardState[r][c].value != 0 },
-                        isCellFixed = { r, c -> boardState[r][c].isFixed }
+                        isCellFixed = { r, c -> boardState[r][c].isFixed },
+                        penActiveState = penActiveState
                     )
                 }
             }
@@ -1931,10 +1942,15 @@ fun rememberTimer(
     startOffset: Int = 0,
     isPaused: Boolean = false,
     resetTimer: Int = 0,
+    holdDisplay: Boolean = false,
     onTimeUpdate: (Int) -> Unit
 ): String {
     var elapsedTime by remember(resetTrigger, resetTimer) { mutableIntStateOf(startOffset) }
     var timeWhenPaused by remember(resetTrigger) { mutableIntStateOf(startOffset) }
+    // Read inside the ticking loop below via rememberUpdatedState so toggling holdDisplay
+    // doesn't restart the LaunchedEffect (that would recompute startTime from the stale
+    // startOffset param and jump the timer backward).
+    val currentHoldDisplay by rememberUpdatedState(holdDisplay)
 
     LaunchedEffect(resetTrigger, isPaused, resetTimer, startOffset) {
         if (!isPaused) {
@@ -1942,15 +1958,31 @@ fun rememberTimer(
             while (true) {
                 kotlinx.coroutines.delay(1000)
                 if (!isPaused) {
-                    elapsedTime = ((System.currentTimeMillis() - startTime) / 1000).toInt()
-                    timeWhenPaused = elapsedTime
-                    onTimeUpdate(elapsedTime)
+                    // Always computed from wall clock, tick or no tick, hold or no hold --
+                    // this is what guarantees zero drift: releasing the hold always
+                    // publishes the true elapsed time, never a value that "lost" the held
+                    // ticks.
+                    val computed = ((System.currentTimeMillis() - startTime) / 1000).toInt()
+                    timeWhenPaused = computed
+                    if (!currentHoldDisplay) {
+                        elapsedTime = computed
+                        onTimeUpdate(computed)
+                    }
                 } else {
                     elapsedTime = timeWhenPaused
                 }
             }
         } else {
             elapsedTime = timeWhenPaused
+        }
+    }
+
+    // Catches the visible display up to the true elapsed time the moment the hold
+    // releases, rather than waiting for the next natural tick (up to ~1s later).
+    LaunchedEffect(holdDisplay) {
+        if (!holdDisplay && !isPaused) {
+            elapsedTime = timeWhenPaused
+            onTimeUpdate(timeWhenPaused)
         }
     }
 

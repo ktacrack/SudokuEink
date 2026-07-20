@@ -22,10 +22,92 @@ To support the stylus properly:
 1. **Onyx Hardware Eraser:** The physical eraser button (which triggers `TOOL_TYPE_ERASER` or `BUTTON_SECONDARY`) is aggressively intercepted by the `TouchHelper` when raw drawing is enabled. Standard `MotionEvent` listeners on the `SurfaceView` will not fire reliably. You **must** override `onBeginRawErasing` and `onEndRawErasing` inside `RawInputCallback` to detect and handle hardware eraser events.
 2. **Scribble Gestures:** When implementing geometric erase heuristics (like zig-zag scribbling or striking out a digit), users frequently lift the stylus, producing multiple rapid, disconnected strokes. Your heuristic algorithms must aggregate bounding boxes (`maxX - minX`) and properties (like directional reversals) across **all strokes** captured within the timeout window, rather than evaluating strokes individually.
 3. **Micro-Strokes Filter:** Small, incidental screen taps (e.g., bounding boxes `< 20px`) should be explicitly filtered out before running heavy ML inference.
-4. **Clearing Ink:** When an erase gesture or hardware erase event triggers the clearing of a cell, you must briefly toggle the raw drawing mode (`touchHelper?.setRawDrawingEnabled(false)` then `true`) after clearing the `SurfaceView` canvas. This forces the E-Ink hardware to flush its native ink buffer and prevents ghost strokes from lingering on the screen.
+4. **Clearing Ink — ☠ do NOT toggle `setRawDrawingEnabled`.** An earlier version of this
+   app cleared ink by briefly toggling `touchHelper?.setRawDrawingEnabled(false)` then
+   `true`. **Do not reintroduce this.** Two confirmed problems, ported over from
+   NonogramEink's freeze investigation (`NonogramEink/NonogramEink/AGENTS.md` →
+   "System-wide ANR / device freeze", incidents #1–3) after this app hit the same class of
+   bug:
+   - **First-stroke-after-flush ink loss.** The toggle calls `leaveScribbleMode` plus a
+     pen-state transition under the hood; re-entering scribble mode happens lazily at the
+     *next* pen-down, so the very next stroke drawn after any flush can lose its start.
+   - **EPD-driver freeze trigger.** Toggling `setRawDrawingEnabled` while the pen is
+     physically on the panel can wedge the Onyx `onyx_epdc` kernel driver in an
+     uninterruptible wait and freeze the entire device (not just this app) — confirmed via
+     live WCHAN capture on a Boox Max3. The freeze is triggered by *any* driver-mode
+     transition racing a pen-down; the toggle is exactly such a transition, and this app's
+     original eraser `ACTION_DOWN` handler toggled while the pen was still touching the
+     panel — the worst case of this race, not merely a rare one.
+
+   **What to do instead:** see "Raw-ink flush pipeline" below — `InkFlushController`
+   clears ink via a repaint bracket (`EpdController.enablePost` + `HAND_WRITING_REPAINT_MODE`)
+   that performs no driver-mode transition, gated so it never fires while `isPenDown`.
 5. **E-ink Hardware Erase Conflict:** When the Onyx system native "Side Button Eraser" is enabled, the hardware performs a highly-optimized local refresh to erase strokes natively. If Android Compose updates its state (e.g., removing a digit badge) at the exact same millisecond that this native hardware clear occurs, the E-Ink controller will drop the Android UI `invalidate()` update because it is busy with the hardware layer. This results in the app's internal state clearing the digit, but the digit physically remaining on the screen. **Fixes required:** 
    - **Debouncing:** Onyx devices may rapidly fire multiple `onEndRawErasing` events for a single physical tap. You must **debounce** the Compose state updates (e.g., `onClearCell`) per cell by ~600ms. This ensures Jetpack Compose only invalidates the UI exactly once, precisely 600ms after the *final* hardware erase finishes, guaranteeing the e-ink screen is idle and will accept the UI refresh.
    - **Stale Lambda Capture (`rememberUpdatedState`):** Because the `TouchHelper` and its listeners (`RawInputCallback`, `onTouchListener`) are initialized only once in the `AndroidView`'s `update` block, they will permanently capture the `onClearCell` lambda from the very first composition. If the user starts a "New Game", `boardState` is re-created, and the captured lambda will silently modify the *discarded* `boardState` instead of the active one. Always wrap all functional parameters passed to `AndroidView` callbacks in `rememberUpdatedState`.
+
+## Raw-ink flush pipeline (`InkFlushController.kt`)
+
+`InlineDrawingCanvas` no longer clears ink inline at each call site. A single
+`InkFlushController` (owned per canvas instance, `remember`ed in the composable) is the
+only thing that flushes ink, and it is the only thing allowed to call the EPD/repaint
+APIs. This mirrors NonogramEink's trailing render/flush pipeline
+(`NonogramEink/NonogramEink/app/.../NonogramGridView.kt`), adapted for a `SurfaceView`
+host instead of a plain custom `View`.
+
+1. **The repaint bracket, not a toggle.** `flushNow()` clears ink by wrapping the
+   `SurfaceView`'s canvas lock/draw/post in
+   `EpdController.setViewDefaultUpdateMode(surfaceView, UpdateMode.HAND_WRITING_REPAINT_MODE)`
+   → `holder.lockCanvas()` → redraw the persisted strokes → `EpdController.enablePost(surfaceView, 1)`
+   **immediately before** `holder.unlockCanvasAndPost(canvas)` → `EpdController.resetViewUpdateMode(surfaceView)`.
+   This is the same pattern the Onyx SDK's own scribble demos use
+   (`OnyxAndroidDemo/.../scribble/request/PartialRefreshRequest.java`,
+   `RendererToScreenRequest.java`) — it clears the raw-ink overlay and redraws committed
+   content in one refresh, with no scribble-mode exit and no pen-state transition.
+2. **`enablePost` must run before every post that should be visible during a pen
+   session.** From the first raw pen-down, the EPD driver stops *posting* window updates
+   to the panel at all — the window renders correctly into its buffer, but nothing reaches
+   the display — until `enablePost` re-enables it. Omitting it silently drops that
+   specific repaint; the strokes still "exist" in the SurfaceView's buffer, they just
+   never appear until the next flush that does call it.
+3. **Never flush while the pen is down.** `flushNow()` bails immediately if
+   `isPenDown == true`. `isPenDown`/`isPenActive` are `@Volatile` and are the *only* state
+   `RawInputCallback` methods write directly — see "Threading discipline" below.
+4. **Scheduling, not immediate execution.** `scheduleFlush(reason, delayMs)` posts a
+   single `Runnable` on the `SurfaceView` (cancelling any pending one first);
+   `cancelPendingFlush(reason)` removes it. Every discard/commit path in the recognition
+   `LaunchedEffect`, both raw-channel `end*` callbacks, and the stylus `MotionEvent`
+   handlers call one of these — see the call sites in `InlineDrawingCanvas.kt` for the
+   full list of reasons (`"fixedCellDiscard"`, `"recognitionCommit"`, `"endErase"`, etc.).
+   Two delays are used: `COMMIT_FLUSH_DELAY_MS` (50 ms, after a definite content change)
+   and `PEN_UP_SAFETY_DELAY_MS` (1000 ms, armed unconditionally on every raw pen-up as a
+   structural guarantee that no discard path can strand ink or leave the EPD post-lock
+   engaged — it sits above the 500 ms recognition timeout so the normal path's own
+   shorter-delay reschedule always wins the race).
+5. **Threading discipline.** `RawInputCallback` methods run on the Onyx SDK's private
+   background executor, never the main thread. They may only: copy primitive point data,
+   flip `controller.isPenDown`/`isPenActive`, and call `scheduleFlush`/`cancelPendingFlush`
+   (safe from any thread — they just `post`/`removeCallbacks` on a `View`). Anything that
+   touches Compose state (`paths`, `inkStrokes`, `onClearCell`, etc.) is wrapped in
+   `view.post { }`. Do not regress this into direct state mutation on the callback thread.
+6. **Second re-arm channel (stylus `MotionEvent`s).** The stylus is double-dispatched —
+   both the raw SDK channel and `onTouchEvent` fire for the same physical stroke. A stray
+   `ACTION_DOWN` the raw channel discards as noise could otherwise cancel a pending flush
+   with no `onEndRaw*` ever following to re-arm it (NonogramEink hit this for real — see
+   its AGENTS.md "Stranded stroke" entry). `onTouchEvent`'s stylus/eraser branch
+   independently cancels on `ACTION_DOWN` and re-arms on `ACTION_UP`/`ACTION_CANCEL`
+   (guarded by `!isPenDown` so it never fights a raw stroke actually in progress).
+7. **Diagnostics.** The whole arm/cancel/flush lifecycle logs under **`SudoFlush`**
+   (`adb logcat -s SudoFlush`), reason-tagged the same way as NonogramEink's `NonoFlush`.
+   No flush should ever log while a preceding `beginDraw`/`beginErase` hasn't yet been
+   followed by its matching `endDraw`/`endErase`.
+
+For the full freeze root-cause history this pipeline defends against (kernel-driver
+deadlock, refresh-mode aggravators, forensic signatures), see
+`NonogramEink/NonogramEink/AGENTS.md` → "System-wide ANR / device freeze". That doc also
+documents `EpdController.getAppScopeRefreshMode()` (device-verified readable/live on a
+Boox Max3) — `MainScreen.kt`'s refresh-mode warning banner uses it via
+`EinkOptimizations.isNonNormalRefreshMode()`.
 
 ## Handwriting Persistence & Undo/Redo State
 When maintaining handwriting strokes (`inkStrokes`) across game sessions and `Undo`/`Redo` actions:
