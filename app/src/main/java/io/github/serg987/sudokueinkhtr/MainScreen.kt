@@ -35,18 +35,17 @@ fun MainScreen(
     val scale = AdaptiveSizes.getScaleFactor()
     var showAlreadyPlayedDialog by remember { mutableStateOf(false) }
 
-    // The E-ink-center per-app refresh mode can change while the app is backgrounded
-    // (floating ball), so re-read it on every resume rather than once per composition.
+    // The E-ink-center per-app refresh mode can change under us at any time. The mode
+    // modal (tap on the system bottom bar) slides OVER the activity without an
+    // onPause/onResume cycle — the only signal it was open is a window-focus loss/gain —
+    // so re-read the mode on every focus regain (which also covers resume-from-background
+    // and screensaver wake, since those end in a focus gain too).
     var showRefreshModeWarning by remember { mutableStateOf(EinkOptimizations.isNonNormalRefreshMode()) }
-    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner) {
-        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
-                showRefreshModeWarning = EinkOptimizations.isNonNormalRefreshMode()
-            }
+    val windowInfo = androidx.compose.ui.platform.LocalWindowInfo.current
+    LaunchedEffect(windowInfo) {
+        snapshotFlow { windowInfo.isWindowFocused }.collect { focused ->
+            if (focused) showRefreshModeWarning = EinkOptimizations.isNonNormalRefreshMode()
         }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     key(currentLanguage, isDarkTheme) {
