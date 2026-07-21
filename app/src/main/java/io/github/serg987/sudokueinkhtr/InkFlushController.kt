@@ -150,6 +150,35 @@ class InkFlushController(
         }
     }
 
+    /**
+     * Plain redraw of the persisted strokes with NO EpdController involvement — for when
+     * the underlying Surface has just been (re)created (screen entry, return from
+     * background). A fresh surface has no raw-ink overlay to clear, so the repaint
+     * bracket buys nothing here — and running it inside the surface-creation/resume
+     * transition (next to `openRawDrawing`'s own scribble init) wedges the driver's
+     * scribble render channel: wet ink stops rendering live and pen input degrades to
+     * flashing normal-mode region updates for the rest of the session (device-verified
+     * 2026-07-20, the first `scheduleFlush("surfaceCreated")` attempt). Same doctrine as
+     * NonogramEink's deaf-pen-session fix: keep EPD/driver IPCs out of transitions.
+     * [flushNow] stays the only path that clears raw ink.
+     */
+    fun redrawStrokes(reason: String) {
+        val view = surfaceView ?: return
+        try {
+            val holder = view.holder
+            val canvas = holder.lockCanvas() ?: return
+            try {
+                canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                drawStrokes(canvas)
+            } finally {
+                holder.unlockCanvasAndPost(canvas)
+            }
+            Log.d(TAG, "plain redraw ($reason)")
+        } catch (t: Throwable) {
+            Log.w(TAG, "plain redraw ($reason) failed", t)
+        }
+    }
+
     /** Call from the composable's teardown, alongside `touchHelper?.closeRawDrawing()`. */
     fun reset() {
         surfaceView?.removeCallbacks(flushRunnable)

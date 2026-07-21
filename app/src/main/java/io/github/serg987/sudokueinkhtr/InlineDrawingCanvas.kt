@@ -268,11 +268,16 @@ fun InlineDrawingCanvas(
                 holder.setFormat(PixelFormat.TRANSPARENT)
                 holder.addCallback(object : SurfaceHolder.Callback {
                     override fun surfaceCreated(holder: SurfaceHolder) {
-                        val canvas = holder.lockCanvas()
-                        canvas?.drawColor(Color.TRANSPARENT, android.graphics.PorterDuff.Mode.CLEAR)
-                        if (canvas != null) {
-                            holder.unlockCanvasAndPost(canvas)
-                        }
+                        // Fires on first layout AND whenever the underlying Surface is torn
+                        // down and rebuilt behind our back -- e.g. backgrounding the app,
+                        // which destroys/recreates the Surface even though this SurfaceView
+                        // instance and inkStrokes are untouched. A fresh surface starts
+                        // blank, so redraw the persisted strokes immediately instead of
+                        // leaving the ink layer empty until the next stroke's flush.
+                        // MUST be the plain EPD-free redraw, NOT scheduleFlush: the repaint
+                        // bracket inside this transition wedges the scribble render channel
+                        // (no live wet ink + flashing cells) -- see redrawStrokes' doc.
+                        controller.redrawStrokes("surfaceCreated")
                     }
                     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
                     override fun surfaceDestroyed(holder: SurfaceHolder) {}
