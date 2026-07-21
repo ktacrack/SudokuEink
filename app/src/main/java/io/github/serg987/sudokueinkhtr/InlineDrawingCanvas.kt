@@ -34,7 +34,12 @@ fun InlineDrawingCanvas(
     onClearCell: (row: Int, col: Int) -> Unit = { _, _ -> },
     isCellFilledWithPencil: (row: Int, col: Int) -> Boolean = { _, _ -> false },
     isCellFixed: (row: Int, col: Int) -> Boolean = { _, _ -> false },
-    penActiveState: MutableState<Boolean>? = null
+    penActiveState: MutableState<Boolean>? = null,
+    // When false the pen is disabled as an *input device*: no wet-ink render, no
+    // recognition, no erase. The persisted strokes stay mounted and visible (that is why
+    // this canvas is no longer wrapped in `if (isPencilMode)` at the call site) — toggling
+    // the pencil button must never make already-written handwriting disappear.
+    penInputEnabled: Boolean = true
 ) {
     val context = LocalContext.current
     val scaleFactor = AdaptiveSizes.getScaleFactor()
@@ -59,6 +64,10 @@ fun InlineDrawingCanvas(
     val currentIsCellFilledWithPencil by rememberUpdatedState(isCellFilledWithPencil)
     val currentIsCellFixed by rememberUpdatedState(isCellFixed)
     val currentInkStrokes by rememberUpdatedState(inkStrokes)
+    // Same rememberUpdatedState discipline as the lambdas above: the RawInputCallback and
+    // onTouchListener are built once in the AndroidView `update` block, so they must read
+    // the live pen-input flag through this delegate, not a value captured at first compose.
+    val currentPenInputEnabled by rememberUpdatedState(penInputEnabled)
 
     var eraseRow by remember { mutableIntStateOf(-1) }
     var eraseCol by remember { mutableIntStateOf(-1) }
@@ -96,6 +105,17 @@ fun InlineDrawingCanvas(
     // and eat the wet ink of the digit currently being written).
     LaunchedEffect(controller.penActiveState.value) {
         penActiveState?.value = controller.penActiveState.value
+    }
+
+    // Turn native wet-ink rendering on/off with the pencil button. This is the SDK render
+    // flag (setRawDrawingRenderEnabled), NOT the banned setRawDrawingEnabled mode toggle
+    // (AGENTS.md "Clearing Ink"): it performs no scribble-mode exit / pen-state transition,
+    // and it is driven only by the pencil button — never mid-stroke — so it cannot race a
+    // pen-down. Disabling render (plus the callback gates below) is what makes the pen inert
+    // as an input device while the persisted-stroke overlay keeps rendering through the
+    // controller's own canvas draws.
+    LaunchedEffect(penInputEnabled, touchHelper) {
+        touchHelper?.setRawDrawingRenderEnabled(penInputEnabled)
     }
 
     DisposableEffect(htrModel) {
@@ -284,6 +304,11 @@ fun InlineDrawingCanvas(
                 })
 
                 setOnTouchListener { _, event ->
+                    // Pen disabled as an input device: swallow nothing, handle nothing. Return
+                    // false so the touch falls through to the Sudoku grid below (finger cell
+                    // selection keeps working) and no eraser/re-arm logic runs.
+                    if (!currentPenInputEnabled) return@setOnTouchListener false
+
                     val toolType = event.getToolType(0)
                     val isStylusOrEraser = toolType == android.view.MotionEvent.TOOL_TYPE_STYLUS ||
                         toolType == android.view.MotionEvent.TOOL_TYPE_ERASER
@@ -398,7 +423,9 @@ fun InlineDrawingCanvas(
                                 controller.isPenDown = false
                                 controller.scheduleFlush("endDraw", InkFlushController.PEN_UP_SAFETY_DELAY_MS)
                                 view.post {
-                                    if (!isErasing) lastStrokeTime = System.currentTimeMillis()
+                                    // Skip arming recognition when the pen is disabled — the
+                                    // flush scheduled above still clears any transient ink.
+                                    if (currentPenInputEnabled && !isErasing) lastStrokeTime = System.currentTimeMillis()
                                 }
                             }
                             override fun onRawDrawingTouchPointMoveReceived(touchPoint: TouchPoint) {}
@@ -407,7 +434,7 @@ fun InlineDrawingCanvas(
                                 // Compose state append itself is posted to main.
                                 val points = touchPointList.points.map { DrawingPoint(it.x, it.y, it.timestamp) }
                                 view.post {
-                                    if (!isErasing) {
+                                    if (currentPenInputEnabled && !isErasing) {
                                         val currentPaths = paths.toMutableList()
                                         currentPaths.add(points)
                                         paths = currentPaths
@@ -419,6 +446,7 @@ fun InlineDrawingCanvas(
                                 controller.isPenActive = true
                                 controller.cancelPendingFlush("beginErase")
                                 view.post {
+                                    if (!currentPenInputEnabled) return@post
                                     isErasing = true
                                     paths = mutableListOf()
                                     lastStrokeTime = 0L
@@ -428,6 +456,7 @@ fun InlineDrawingCanvas(
                                 controller.isPenDown = false
                                 controller.scheduleFlush("endErase", InkFlushController.COMMIT_FLUSH_DELAY_MS)
                                 view.post {
+                                    if (!currentPenInputEnabled) return@post
                                     val col = (touchPoint.x / (viewWidth / 9f)).toInt().coerceIn(0, 8)
                                     val row = (touchPoint.y / (viewHeight / 9f)).toInt().coerceIn(0, 8)
                                     Log.d("InlineDrawingCanvas", "onEndRawErasing. row=$row, col=$col")

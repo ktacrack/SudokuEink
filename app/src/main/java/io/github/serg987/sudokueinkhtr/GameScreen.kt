@@ -764,47 +764,48 @@ fun GameScreen(
                                 }
                             }
                         )
-                        if (isPencilMode) {
-                            InlineDrawingCanvas(
-                                modifier = Modifier.matchParentSize(),
-                                inkStrokes = inkStrokes,
-                                onInkStrokesChanged = { inkStrokes = it },
-                                notesMode = notesMode,
-                                onDigitRecognized = { digit, row, col ->
-                                    if (!isPaused && !boardState[row][col].isFixed && digit in 1..9) {
-                                        updateBoard(
-                                            boardState.mapIndexed { r, rowList ->
-                                                rowList.mapIndexed { c, cell ->
-                                                    if (r == row && c == col) {
-                                                        when (notesMode) {
-                                                            NotesMode.MANUAL -> {
-                                                                val newNotes = if (cell.notes.contains(digit)) cell.notes - digit else cell.notes + digit
-                                                                cell.copy(notes = newNotes)
-                                                            }
-                                                            NotesMode.AUTO, NotesMode.OFF -> cell.copy(value = digit, notes = emptySet(), isPencil = true)
+                        // Always mounted so committed handwriting stays visible; the pencil
+                        // button only enables/disables the pen as an input device.
+                        InlineDrawingCanvas(
+                            modifier = Modifier.matchParentSize(),
+                            inkStrokes = inkStrokes,
+                            onInkStrokesChanged = { inkStrokes = it },
+                            notesMode = notesMode,
+                            onDigitRecognized = { digit, row, col ->
+                                if (!isPaused && !boardState[row][col].isFixed && digit in 1..9) {
+                                    updateBoard(
+                                        boardState.mapIndexed { r, rowList ->
+                                            rowList.mapIndexed { c, cell ->
+                                                if (r == row && c == col) {
+                                                    when (notesMode) {
+                                                        NotesMode.MANUAL -> {
+                                                            val newNotes = if (cell.notes.contains(digit)) cell.notes - digit else cell.notes + digit
+                                                            cell.copy(notes = newNotes)
                                                         }
-                                                    } else cell
-                                                }
+                                                        NotesMode.AUTO, NotesMode.OFF -> cell.copy(value = digit, notes = emptySet(), isPencil = true)
+                                                    }
+                                                } else cell
                                             }
-                                        )
-                                    }
-                                },
-                                onClearCell = { row, col ->
-                                    if (!isPaused && !boardState[row][col].isFixed) {
-                                        updateBoard(
-                                            boardState.mapIndexed { r, rowList ->
-                                                rowList.mapIndexed { c, cell ->
-                                                    if (r == row && c == col) cell.copy(value = 0, isPencil = false) else cell
-                                                }
+                                        }
+                                    )
+                                }
+                            },
+                            onClearCell = { row, col ->
+                                if (!isPaused && !boardState[row][col].isFixed) {
+                                    updateBoard(
+                                        boardState.mapIndexed { r, rowList ->
+                                            rowList.mapIndexed { c, cell ->
+                                                if (r == row && c == col) cell.copy(value = 0, isPencil = false) else cell
                                             }
-                                        )
-                                    }
-                                },
-                                isCellFilledWithPencil = { r, c -> boardState[r][c].isPencil && boardState[r][c].value != 0 },
-                                isCellFixed = { r, c -> boardState[r][c].isFixed },
-                                penActiveState = penActiveState
-                            )
-                        }
+                                        }
+                                    )
+                                }
+                            },
+                            isCellFilledWithPencil = { r, c -> boardState[r][c].isPencil && boardState[r][c].value != 0 },
+                            isCellFixed = { r, c -> boardState[r][c].isFixed },
+                            penActiveState = penActiveState,
+                            penInputEnabled = isPencilMode
+                        )
                     }
 
                 }
@@ -1283,47 +1284,48 @@ fun GameScreen(
                         }
                     }
                 )
-                if (isPencilMode) {
-                    InlineDrawingCanvas(
-                        modifier = Modifier.matchParentSize(),
-                        inkStrokes = inkStrokes,
-                        onInkStrokesChanged = { inkStrokes = it },
-                        notesMode = notesMode,
-                        onDigitRecognized = { digit, row, col ->
-                            if (!isPaused && !boardState[row][col].isFixed && digit in 1..9) {
-                                updateBoard(
-                                    boardState.mapIndexed { r, rowList ->
-                                        rowList.mapIndexed { c, cell ->
-                                            if (r == row && c == col) {
-                                                when (notesMode) {
-                                                    NotesMode.MANUAL -> {
-                                                        val newNotes = if (cell.notes.contains(digit)) cell.notes - digit else cell.notes + digit
-                                                        cell.copy(notes = newNotes)
-                                                    }
-                                                    NotesMode.AUTO, NotesMode.OFF -> cell.copy(value = digit, notes = emptySet(), isPencil = true)
+                // Always mounted so committed handwriting stays visible; the pencil
+                // button only enables/disables the pen as an input device.
+                InlineDrawingCanvas(
+                    modifier = Modifier.matchParentSize(),
+                    inkStrokes = inkStrokes,
+                    onInkStrokesChanged = { inkStrokes = it },
+                    notesMode = notesMode,
+                    onDigitRecognized = { digit, row, col ->
+                        if (!isPaused && !boardState[row][col].isFixed && digit in 1..9) {
+                            updateBoard(
+                                boardState.mapIndexed { r, rowList ->
+                                    rowList.mapIndexed { c, cell ->
+                                        if (r == row && c == col) {
+                                            when (notesMode) {
+                                                NotesMode.MANUAL -> {
+                                                    val newNotes = if (cell.notes.contains(digit)) cell.notes - digit else cell.notes + digit
+                                                    cell.copy(notes = newNotes)
                                                 }
-                                            } else cell
-                                        }
+                                                NotesMode.AUTO, NotesMode.OFF -> cell.copy(value = digit, notes = emptySet(), isPencil = true)
+                                            }
+                                        } else cell
                                     }
-                                )
-                            }
-                        },
-                        onClearCell = { row, col ->
-                            if (!isPaused && !boardState[row][col].isFixed) {
-                                updateBoard(
-                                    boardState.mapIndexed { r, rowList ->
-                                        rowList.mapIndexed { c, cell ->
-                                            if (r == row && c == col) cell.copy(value = 0, isPencil = false) else cell
-                                        }
+                                }
+                            )
+                        }
+                    },
+                    onClearCell = { row, col ->
+                        if (!isPaused && !boardState[row][col].isFixed) {
+                            updateBoard(
+                                boardState.mapIndexed { r, rowList ->
+                                    rowList.mapIndexed { c, cell ->
+                                        if (r == row && c == col) cell.copy(value = 0, isPencil = false) else cell
                                     }
-                                )
-                            }
-                        },
-                        isCellFilledWithPencil = { r, c -> boardState[r][c].isPencil && boardState[r][c].value != 0 },
-                        isCellFixed = { r, c -> boardState[r][c].isFixed },
-                        penActiveState = penActiveState
-                    )
-                }
+                                }
+                            )
+                        }
+                    },
+                    isCellFilledWithPencil = { r, c -> boardState[r][c].isPencil && boardState[r][c].value != 0 },
+                    isCellFixed = { r, c -> boardState[r][c].isFixed },
+                    penActiveState = penActiveState,
+                    penInputEnabled = isPencilMode
+                )
             }
 
             Spacer(modifier = Modifier.height((10 * scale).dp))
