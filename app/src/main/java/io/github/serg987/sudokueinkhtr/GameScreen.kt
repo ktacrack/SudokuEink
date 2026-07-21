@@ -1880,7 +1880,14 @@ fun SudokuBoard(
                                     fontSize = if (cell.isFixed) (30 * scale).sp else (54 * scale).sp,
                                     color = textColor,
                                     fontWeight = if (cell.isFixed) FontWeight.Bold else FontWeight.Normal,
-                                    fontFamily = if (cell.isFixed) null else caveatFontFamily
+                                    fontFamily = if (cell.isFixed) null else caveatFontFamily,
+                                    // Caveat reserves tall ascender/descender space even for digits
+                                    // that don't use it. In smaller (landscape) cells the Box
+                                    // constrains that oversized bounding box before it can center,
+                                    // clipping the glyph off-center. wrapContentSize(unbounded=true)
+                                    // lets it lay out at natural size so the Box's Alignment.Center
+                                    // centers the actual glyph, matching the notes-grid fix below.
+                                    modifier = if (cell.isFixed) Modifier else Modifier.wrapContentSize(unbounded = true)
                                 )
                             }
                         } else if (cell.notes.isNotEmpty()) {
