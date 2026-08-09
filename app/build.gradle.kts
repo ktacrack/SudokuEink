@@ -13,8 +13,8 @@ android {
         applicationId = "io.github.serg987.sudokueinkhtr"
         minSdk = 26
         targetSdk = 36
-        versionCode = 7
-        versionName = "0.1.0"
+        versionCode = 8
+        versionName = "0.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -122,6 +122,14 @@ dependencies {
     
     // Onyx SDK for stylus support
     implementation("com.onyx.android.sdk:onyxsdk-pen:1.4.11")
+
+    // Software wet-ink path for non-Onyx (LCD) devices — see DeviceCaps.isOnyx. Ported
+    // from NonogramEink; don't downgrade to the alphas (StockBrushes members became
+    // functions, e.g. pressurePen()).
+    implementation("androidx.ink:ink-authoring:1.0.0")
+    implementation("androidx.ink:ink-brush:1.0.0")
+    implementation("androidx.ink:ink-strokes:1.0.0")
+    implementation("androidx.input:input-motionprediction:1.0.0")
 
     // Fix namespace conflict from older jetified libraries
     implementation("androidx.vectordrawable:vectordrawable:1.1.0")

@@ -30,6 +30,16 @@ The original app is fantastic, but we pursued a different vision and philosophy 
 - **E-ink Optimized UI:** The UI has been heavily altered to use a high-contrast, strictly black-and-white palette (utilizing the Mudita UI package). This reduces the need for constant screen refreshes and minimizes e-ink ghosting.
 - **Flattened Menus:** We flattened many previous distinct menus and moved settings into a central place, freeing the main game screen from side interactions.
 - **Action-First Game UX:** The board is cleaner with no background. Button behavior is now "action-first" – you tap a tool (like a digit or eraser), then tap the cell to apply it. We eliminated dynamic highlights to further reduce screen flashes and ghosting.
+- **No click ripple/flash:** Removed the default Material ripple app-wide. On e-ink its gray fill sits below the panel's refresh threshold and lingers for about a second as a visible ghost instead of animating away.
+
+### Runs on Non-Onyx Stylus Tablets Too
+The app was originally Onyx-only (the Onyx Pen SDK's `TouchHelper` handled stylus capture,
+and the e-ink panel's own driver rendered the wet ink). It now also runs on plain LCD
+stylus tablets — device-verified on a **Teclast Airpad Pro** (Android 15, non-EMR stylus).
+Since there's no EPD driver to draw ink on those screens, the app falls back to capturing
+the stylus itself and rendering wet ink in software (`androidx.ink`), matching the approach
+already proven in our sibling app, NonogramEink. This is a pure input-layer swap —
+gameplay, recognition, and persistence are identical on both device families.
 
 ### Enhanced Handwriting Recognition Models
 We've integrated new, more precise models for handwriting recognition, providing an improved stylus experience.
@@ -45,7 +55,9 @@ We've integrated new, more precise models for handwriting recognition, providing
 ## Known Bugs & Issues
 - **Dark Mode:** Dark mode is currently not working and the toggle has been disabled in settings.
 - **Screen Orientation:** When switching screen orientation (e.g., portrait to landscape), handwritten notes may not align correctly with the cells.
-- **Device Support:** Currently tested only on the Onyx Boox Max3 (13.3").
+- **Device Support:** Tested on the Onyx Boox Max3 (13.3", e-ink) and a Teclast Airpad Pro
+  (LCD, non-EMR stylus). Other non-Onyx stylus tablets should work via the same fallback
+  path but are unverified.
 
 ---
 
@@ -68,7 +80,8 @@ We've integrated new, more precise models for handwriting recognition, providing
 ## Installation
 
 1. Download the APK from Releases.
-2. Install the APK on your e-ink device (tested on Boox).
+2. Install the APK on your e-ink device (tested on Boox) or a stylus-capable LCD tablet
+   (tested on Teclast).
 3. Open the app, optionally download the enhanced models in the Settings, and start playing!
 
 ## License

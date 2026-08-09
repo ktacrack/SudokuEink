@@ -109,12 +109,97 @@ documents `EpdController.getAppScopeRefreshMode()` (device-verified readable/liv
 Boox Max3) — `MainScreen.kt`'s refresh-mode warning banner uses it via
 `EinkOptimizations.isNonNormalRefreshMode()`.
 
+## Non-Onyx (LCD) Device Support — DeviceCaps + androidx.ink
+
+The app runs unmodified on non-Onyx stylus tablets, with the pen pipeline swapped out
+behind **`DeviceCaps.isOnyx`**. Device-verified on a Teclast Airpad Pro (Android 15,
+non-EMR stylus). Ported directly from NonogramEink's non-Onyx support
+(`NonogramEink/NonogramEink/AGENTS.md` → "Non-Onyx (LCD) Device Support"), adapted to
+Sudoku's whole-cell erase and HTR-recognition flow.
+
+### Why no `TouchHelper` at all on non-Onyx
+The Onyx SDK's `TouchHelper` **captures input on non-Onyx devices too**, through an
+undocumented fallback — but it also **eats the view's stylus AND finger `MotionEvent`s**.
+On this app that broke two things at once: no wet ink ever rendered (Onyx ink is drawn by
+the EPD driver; an LCD has none), and every action-first button (digit/erase/notes) went
+dead, because they depend on a **finger tap on a cell** (`SudokuBoard`'s
+`combinedClickable`) which the fallback silently consumed — even with the pencil button off
+(that only flips `setRawDrawingRenderEnabled`, not `setRawDrawingEnabled`). **Decision: on
+non-Onyx, never create the `TouchHelper`.** `InlineDrawingCanvas`'s layout listener checks
+`DeviceCaps.isOnyx` before building it; everything below replaces it.
+
+### Software ink path (androidx.ink 1.0.0 stable)
+- **Deps** (`app/build.gradle.kts`): `androidx.ink:ink-authoring:1.0.0`, `ink-brush`,
+  `ink-strokes`, plus `androidx.input:input-motionprediction:1.0.0`. Don't downgrade to the
+  alphas (API renames: `StockBrushes` members became functions like `pressurePen()`).
+- **Two-layer overlay** (`InlineDrawingCanvas`'s `factory`, non-Onyx branch): a
+  `FrameLayout` holding a plain [`PersistedInkView`](PersistedInkView.kt) (committed
+  strokes only, drawn via the same `drawInkStrokes` routine the Onyx repaint bracket uses —
+  see `InkFlushController.kt`) underneath an `InProgressStrokesView` (wet ink, low-latency
+  front-buffered). **Not** a second `SurfaceView` for the committed layer: the overlay is
+  itself a front-buffered `SurfaceView`, and two "on top" surfaces in one window have no
+  defined relative Z-order — a plain `View` avoids that entirely.
+- **Capture**: `handleSoftwareStylusEvent()` in `InlineDrawingCanvas.kt`, wired as the
+  `FrameLayout`'s `setOnTouchListener` — with historical points (`getHistorical*`), so the
+  digit recognizer sees Onyx-comparable point density. `requestUnbufferedDispatch` on DOWN.
+  Finger events return `false` immediately so they fall through to `SudokuBoard`.
+- **Lifecycle maps onto the Onyx `RawInputCallback`** it replaces, so the shared flush and
+  recognition pipeline (`InkFlushController`, the `LaunchedEffect(lastStrokeTime)`
+  recognition timeout, `isEraseGesture` heuristics) runs unchanged on both paths:
+
+  | Onyx raw channel | Software path |
+  |---|---|
+  | `onBeginRawDrawing` | `ACTION_DOWN` (flags + cancel pending flush + start overlay stroke) |
+  | `onRaw*TouchPointListReceived` | points accumulated per-MOVE, appended to `paths` at UP |
+  | `onEndRawDrawing` → arms `lastStrokeTime` | `ACTION_UP` → same |
+  | EPD driver renders wet ink | `InProgressStrokesView` renders wet ink |
+  | flush = `enablePost` + `HAND_WRITING_REPAINT_MODE` repaint | flush = `persistedView.invalidate()` then, `OVERLAY_CLEAR_DELAY_MS` later, `removeFinishedStrokes` (`InkFlushController.flushSoftware`) |
+
+  Finished strokes stay rendered in the overlay (androidx.ink keeps them until
+  `removeFinishedStrokes`) — same "ink stays up during a fast burst, one commit shortly
+  after the last pen-up" UX on both device families.
+- **Whole-cell erase** (barrel button / eraser tool) is handled entirely inside
+  `handleSoftwareStylusEvent`, mirroring the Onyx `onBeginRawErasing`/`onEndRawErasing` pair
+  (clear the targeted cell's `inkStrokes` entry + debounced `onClearCell`, no ink ever
+  drawn) rather than NonogramEink's per-tile toggle — that heuristic gesture erase (strike-
+  through/scribble/X over a pencil-filled cell) is a *separate*, already-shared mechanism
+  (`isEraseGesture`, evaluated in the recognition `LaunchedEffect`) that needs no non-Onyx
+  special-casing at all, as long as regular (non-eraser) strokes populate `paths` normally.
+  - ☠ **Do NOT decide erasing-ness only at `ACTION_DOWN`.** The himax driver on this pen can
+    report a button held *before* touch-down as `buttonState=0` in the DOWN event, with the
+    flag appearing only in the first `ACTION_MOVE` a few ms later (device-verified via
+    NonogramEink's `NonoStylus` logs on this same pen). The check therefore re-runs on every
+    MOVE as an **upgrade-only** flip (never downgraded once true) — any wet ink already
+    drawn before the upgrade is cancelled via `inkOverlay.cancelStroke`, since Onyx's raw
+    erase channel never draws ink either.
+- **Diagnostics**: `adb logcat -s SudoStylus` — one line per DOWN/UP/CANCEL (MOVE stays
+  silent to avoid flooding), tagged with `action`/`toolType`/`buttonState`/`pressure`, plus
+  a one-shot `DeviceCaps.isOnyx` line at canvas init.
+
+### What else is gated on `DeviceCaps.isOnyx`
+- `InkFlushController`: `onyxSurface`/`persistedView`+`inkOverlay` are mutually exclusive
+  (only one pair is ever populated), and `flushNow`/`redrawStrokes` branch on
+  `DeviceCaps.isOnyx` to pick the EPD repaint bracket vs. the software equivalent.
+  `EpdController` is never called on non-Onyx (every call there is a silent no-op — "it
+  didn't throw" is not "it worked").
+- `EinkOptimizations.isNonNormalRefreshMode()` (Onyx refresh-mode warning banner) already
+  short-circuits to `false` on non-Onyx via its own manufacturer check.
+
+### Known benign log noise (MediaTek)
+`surfaceflinger E BufferQueueDump ... logFpsState_onCheckFps` spam appears once the ink
+overlay exists — it's MTK's FPS-Go vendor framework dumping per-layer state for the
+overlay's SurfaceView at Error severity (any SurfaceView app does this on this chipset).
+Harmless; only investigate if it's accompanied by an actual rendering symptom (missing
+ink, flicker, black rectangles). `PowerHalMgrImpl` info lines are the same framework
+reacting to render activity. Same noise NonogramEink documented for this device family.
+
 ## Handwriting Persistence & Undo/Redo State
 When maintaining handwriting strokes (`inkStrokes`) across game sessions and `Undo`/`Redo` actions:
 1. **Source of Truth:** Since the Onyx `TouchHelper` only manages the ephemeral native e-ink layer, `inkStrokes` (a `Map` of cell coordinates to lists of `DrawingPoint`s) must be hoisted to the main Compose `GameScreen`. This state is re-applied to the canvas using Compose's standard `Canvas` or `Path` drawing to ensure strokes persist when the native hardware layer is flushed or when the app restarts.
 2. **Synchronized History:** The `inkStrokes` map must be pushed into its own `SnapshotStateList` history (e.g., `inkStrokesHistory`) perfectly synchronized with `moveHistory` during any board update. 
 3. **Asynchronous Stale State (Ghost Restores):** When utilizing `LaunchedEffect` to wait for a stroke debounce timeout before recognizing a digit, the `LaunchedEffect` captures the `inkStrokes` value at the moment the stroke was drawn. If the user clears the cell with the eraser *before* the timeout completes, the asynchronous block will finish and append its recognized result to the **stale** `inkStrokes` map it captured, effectively "restoring" handwriting that was just deleted. You **must** read `currentInkStrokes` via `rememberUpdatedState` directly inside the asynchronous block right before modifying it.
 4. **Duplicate Eraser Events:** Never allow Android's `onTouchEvent` handling of `TOOL_TYPE_ERASER` to redundantly clear game state alongside the Onyx SDK's `RawInputCallback.onEndRawErasing`. This double-firing will push duplicate empty states into `moveHistory`, which causes the `Undo` button to pop an identical state and appear "broken" (doing nothing). Let the debounced `onEndRawErasing` handle the state updates.
+4a. **Reset clears ink by design.** `GameScreen`'s Reset buttons set `inkStrokes = emptyMap()`, not `inkStrokes = initialStrokes`. `initialStrokes` holds whatever handwriting was in the save file at screen entry — reassigning it on Reset silently *restores* old ink instead of clearing it, which also defeats the point of Reset returning to the untouched puzzle (fixed clues only), exactly what `initialBoard` already does to `boardState`. `initialStrokes` still does its real job: seeding `inkStrokes` once, on mount, from a saved game.
 5. **State Synchronization between Button Inputs and Handwriting:** When overriding or clearing a cell using UI action buttons (digit entry or eraser) that was previously populated by handwritten input, you must explicitly reset its `isPencil` state to `false`. Otherwise, the cell will get stuck rendering the new digit using the multi-badge pencil layout rather than the standard centered text layout.
 6. **Pencil button gates input, NOT the overlay — never unmount `InlineDrawingCanvas` to "turn the pen off".** The persisted-stroke overlay *is* that composable's `SurfaceView` (repainted by `InkFlushController`'s own canvas draws). An earlier version wrapped the call site in `if (isPencilMode) { InlineDrawingCanvas(...) }`, so toggling the pencil button off unmounted the surface and made already-committed handwriting vanish (it reappeared on re-enable only because `surfaceCreated` redraws the strokes). **Do not reintroduce that wrapper.** Keep the canvas mounted unconditionally and pass the button state through as `penInputEnabled` instead:
    - **Disabling input** = flip native rendering off with `TouchHelper.setRawDrawingRenderEnabled(penInputEnabled)` (in a `LaunchedEffect(penInputEnabled, touchHelper)`) **plus** gating the `RawInputCallback`/`onTouchListener` bodies on `currentPenInputEnabled` (via `rememberUpdatedState`, same discipline as the other lambda params). This is the render flag, **not** the banned `setRawDrawingEnabled` mode toggle (see "Clearing Ink" above): it does no scribble-mode/pen-state transition, and it only ever fires from the button — never mid-stroke — so it can't race a pen-down.

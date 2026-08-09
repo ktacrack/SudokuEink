@@ -7,30 +7,43 @@ import android.graphics.Path
 import android.graphics.PorterDuff
 import android.util.Log
 import android.view.SurfaceView
+import android.view.View
 import androidx.compose.runtime.mutableStateOf
+import androidx.ink.authoring.InProgressStrokeId
+import androidx.ink.authoring.InProgressStrokesView
 import com.onyx.android.sdk.api.device.epd.EpdController
 import com.onyx.android.sdk.api.device.epd.UpdateMode
 
 /**
- * Owns the raw-ink flush lifecycle for [InlineDrawingCanvas]: clearing the Onyx raw-ink
- * overlay and repainting the [SurfaceView] with the committed strokes, without ever
- * toggling `TouchHelper.setRawDrawingEnabled` to do it. See AGENTS.md "Clearing Ink" for
- * why that toggle is banned: it loses the next stroke's ink start (lazy scribble-mode
- * re-entry) and is a confirmed EPD-driver freeze trigger on Onyx devices — see
- * NonogramEink's freeze investigation
- * (`NonogramEink/NonogramEink/AGENTS.md` → "System-wide ANR / device freeze"), which this
- * flush pattern was ported from. The repaint bracket itself follows the Onyx SDK's own
- * scribble demos (`OnyxAndroidDemo` → `scribble/request/PartialRefreshRequest.java` /
- * `RendererToScreenRequest.java`): `setViewDefaultUpdateMode(surfaceView,
- * HAND_WRITING_REPAINT_MODE)` → `lockCanvas()` → draw → `enablePost(surfaceView, 1)`
- * immediately before `unlockCanvasAndPost` → `resetViewUpdateMode(surfaceView)`.
+ * Owns the raw-ink flush lifecycle for [InlineDrawingCanvas]: clearing the wet-ink layer
+ * and repainting the committed strokes, without ever toggling
+ * `TouchHelper.setRawDrawingEnabled` to do it. See AGENTS.md "Clearing Ink" for why that
+ * toggle is banned: it loses the next stroke's ink start (lazy scribble-mode re-entry) and
+ * is a confirmed EPD-driver freeze trigger on Onyx devices — see NonogramEink's freeze
+ * investigation (`NonogramEink/NonogramEink/AGENTS.md` → "System-wide ANR / device
+ * freeze"), which this flush pattern was ported from.
  *
- * THREADING: [isPenDown]/[isPenActive] are `@Volatile` because `RawInputCallback` methods
- * run on the Onyx SDK's private background executor, not the main thread. Code on that
- * thread may only flip these flags and call [scheduleFlush]/[cancelPendingFlush] (which
- * just `post`/`removeCallbacks` a `Runnable` on the `SurfaceView` — safe from any thread).
+ * Two device pipelines share this controller (see [DeviceCaps]):
+ * - **Onyx**: wet ink is rendered natively by the EPD driver; [flushNow] clears it with the
+ *   repaint bracket the Onyx SDK's own scribble demos use
+ *   (`OnyxAndroidDemo` → `scribble/request/PartialRefreshRequest.java` /
+ *   `RendererToScreenRequest.java`): `setViewDefaultUpdateMode(onyxSurface,
+ *   HAND_WRITING_REPAINT_MODE)` → `lockCanvas()` → draw → `enablePost(onyxSurface, 1)`
+ *   immediately before `unlockCanvasAndPost` → `resetViewUpdateMode(onyxSurface)`.
+ * - **Non-Onyx (LCD)**: there is no EPD driver, so wet ink is rendered by an
+ *   `InProgressStrokesView` overlay ([inkOverlay]) and committed strokes by a plain
+ *   [PersistedInkView] ([persistedView]) underneath it. [flushNow] "clears" the wet layer
+ *   by invalidating the persisted view (so committed ink is on screen) and then removing
+ *   the settled overlay strokes ([clearSoftwareInk]) — ported from NonogramEink's
+ *   `flushHardwareInk` non-Onyx branch.
+ *
+ * THREADING: [isPenDown]/[isPenActive] are `@Volatile` because on Onyx, `RawInputCallback`
+ * methods run on the Onyx SDK's private background executor, not the main thread. Code on
+ * that thread may only flip these flags and call [scheduleFlush]/[cancelPendingFlush]
+ * (which just `post`/`removeCallbacks` a `Runnable` on [hostView] — safe from any thread).
  * All actual rendering happens inside [flushNow], which only ever runs as that posted
- * runnable, i.e. on the main thread.
+ * runnable, i.e. on the main thread. On non-Onyx, capture already happens on the main
+ * thread (`MotionEvent`s), so this is stricter than required there — kept uniform anyway.
  */
 class InkFlushController(
     private val strokesProvider: () -> Map<Pair<Int, Int>, List<List<DrawingPoint>>>,
@@ -51,6 +64,14 @@ class InkFlushController(
          * engaged.
          */
         const val PEN_UP_SAFETY_DELAY_MS = 1000L
+
+        /**
+         * Non-Onyx only: gap between invalidating [persistedView] (committed strokes) and
+         * removing the settled strokes from [inkOverlay] (wet ink). Both layers draw
+         * identical black ink, so this small overlap is invisible, but clearing the overlay
+         * first would blink the digit off for a frame before the persisted layer catches up.
+         */
+        const val OVERLAY_CLEAR_DELAY_MS = 50L
     }
 
     @Volatile
@@ -69,25 +90,47 @@ class InkFlushController(
     /** Main-thread-safe mirror of [isPenActive] for Compose readers (the game timer). */
     val penActiveState = mutableStateOf(false)
 
-    /** Set once the composable creates the SurfaceView; null before first layout. */
-    var surfaceView: SurfaceView? = null
+    /**
+     * View used for `postDelayed`/`removeCallbacks` scheduling — the Onyx `SurfaceView` or
+     * the non-Onyx `FrameLayout`, whichever the composable created. Set once at first
+     * layout; null before then.
+     */
+    var hostView: View? = null
+
+    /** Onyx only: the `SurfaceView` the EPD repaint bracket locks/draws/posts on. */
+    var onyxSurface: SurfaceView? = null
+
+    /** Non-Onyx only: the plain view holding committed strokes. */
+    var persistedView: PersistedInkView? = null
+
+    /** Non-Onyx only: the wet-ink overlay. */
+    var inkOverlay: InProgressStrokesView? = null
+
+    /**
+     * Non-Onyx only: finished-but-not-yet-flushed overlay strokes (the LCD analogue of raw
+     * ink still on the e-ink panel). Main thread only — populated by the
+     * `InProgressStrokesFinishedListener` registered in [InlineDrawingCanvas].
+     */
+    val finishedInkIds = mutableSetOf<InProgressStrokeId>()
 
     private val flushRunnable = Runnable { flushNow() }
+    private val overlayClearRunnable = Runnable { clearSoftwareInk() }
 
     fun cancelPendingFlush(reason: String) {
-        surfaceView?.removeCallbacks(flushRunnable)
+        hostView?.removeCallbacks(flushRunnable)
+        hostView?.removeCallbacks(overlayClearRunnable)
         Log.d(TAG, "cancel flush ($reason) isPenDown=$isPenDown")
     }
 
     fun scheduleFlush(reason: String, delayMs: Long) {
-        val view = surfaceView ?: return
+        val view = hostView ?: return
         view.removeCallbacks(flushRunnable)
         Log.d(TAG, "arm flush ($reason) delay=$delayMs isPenDown=$isPenDown")
         view.postDelayed(flushRunnable, delayMs)
     }
 
     private fun flushNow() {
-        val view = surfaceView ?: return
+        val view = hostView ?: return
         if (isPenDown) {
             // The pen came back down before the settle delay elapsed. Whichever begin*
             // callback caused this already cancelled us; do nothing here and rely on the
@@ -96,6 +139,16 @@ class InkFlushController(
             Log.d(TAG, "flush bailed: isPenDown (awaiting pen-up re-arm)")
             return
         }
+        if (DeviceCaps.isOnyx) {
+            flushOnyx()
+        } else {
+            flushSoftware(view)
+        }
+        isPenActive = false
+    }
+
+    private fun flushOnyx() {
+        val view = onyxSurface ?: return
         try {
             val holder = view.holder
             EpdController.setViewDefaultUpdateMode(view, UpdateMode.HAND_WRITING_REPAINT_MODE)
@@ -115,39 +168,36 @@ class InkFlushController(
             }
             EpdController.resetViewUpdateMode(view)
         } catch (t: Throwable) {
-            // Non-Onyx device: EpdController calls are silent no-ops there, so this is a
-            // real failure only on Onyx hardware. lockCanvas/unlockCanvasAndPost above (if
-            // reached) already redrew the strokes regardless — only the raw-ink-overlay
-            // clear may be missing, which the next flush corrects.
+            // Only reachable on Onyx (this function never runs on non-Onyx — see
+            // flushNow). lockCanvas/unlockCanvasAndPost above (if reached) already redrew
+            // the strokes regardless — only the raw-ink-overlay clear may be missing,
+            // which the next flush corrects.
             Log.w(TAG, "flush repaint bracket failed", t)
         }
-        isPenActive = false
-        Log.d(TAG, "flush complete")
+        Log.d(TAG, "flush complete (epd)")
+    }
+
+    /**
+     * Non-Onyx: invalidate the persisted-strokes view so the just-committed content is on
+     * screen, then remove the settled overlay strokes a beat later ([OVERLAY_CLEAR_DELAY_MS])
+     * so the hand-off from wet to committed ink never blinks.
+     */
+    private fun flushSoftware(view: View) {
+        persistedView?.invalidate()
+        view.removeCallbacks(overlayClearRunnable)
+        view.postDelayed(overlayClearRunnable, OVERLAY_CLEAR_DELAY_MS)
+        Log.d(TAG, "flush complete (software)")
+    }
+
+    /** Removes every finished (settled) stroke from the software ink overlay, if any. */
+    private fun clearSoftwareInk() {
+        if (finishedInkIds.isEmpty()) return
+        inkOverlay?.removeFinishedStrokes(finishedInkIds.toSet())
+        finishedInkIds.clear()
     }
 
     private fun drawStrokes(canvas: Canvas) {
-        val paint = Paint().apply {
-            color = Color.BLACK
-            strokeWidth = strokeWidthProvider()
-            style = Paint.Style.STROKE
-            strokeCap = Paint.Cap.ROUND
-            isAntiAlias = true
-        }
-        for ((_, strokes) in strokesProvider()) {
-            strokes.forEach { list ->
-                if (list.isNotEmpty()) {
-                    val path = Path()
-                    var prePoint = list[0]
-                    path.moveTo(prePoint.x, prePoint.y)
-                    for (i in 1 until list.size) {
-                        val point = list[i]
-                        path.quadTo(prePoint.x, prePoint.y, point.x, point.y)
-                        prePoint = point
-                    }
-                    canvas.drawPath(path, paint)
-                }
-            }
-        }
+        drawInkStrokes(canvas, strokesProvider(), strokeWidthProvider())
     }
 
     /**
@@ -161,9 +211,17 @@ class InkFlushController(
      * 2026-07-20, the first `scheduleFlush("surfaceCreated")` attempt). Same doctrine as
      * NonogramEink's deaf-pen-session fix: keep EPD/driver IPCs out of transitions.
      * [flushNow] stays the only path that clears raw ink.
+     *
+     * Non-Onyx: there's no Surface lifecycle to mirror here (the [PersistedInkView] is a
+     * plain `View`) — just invalidate it.
      */
     fun redrawStrokes(reason: String) {
-        val view = surfaceView ?: return
+        if (!DeviceCaps.isOnyx) {
+            persistedView?.invalidate()
+            Log.d(TAG, "plain redraw ($reason) (software)")
+            return
+        }
+        val view = onyxSurface ?: return
         try {
             val holder = view.holder
             val canvas = holder.lockCanvas() ?: return
@@ -173,7 +231,7 @@ class InkFlushController(
             } finally {
                 holder.unlockCanvasAndPost(canvas)
             }
-            Log.d(TAG, "plain redraw ($reason)")
+            Log.d(TAG, "plain redraw ($reason) (epd)")
         } catch (t: Throwable) {
             Log.w(TAG, "plain redraw ($reason) failed", t)
         }
@@ -181,8 +239,45 @@ class InkFlushController(
 
     /** Call from the composable's teardown, alongside `touchHelper?.closeRawDrawing()`. */
     fun reset() {
-        surfaceView?.removeCallbacks(flushRunnable)
+        hostView?.removeCallbacks(flushRunnable)
+        hostView?.removeCallbacks(overlayClearRunnable)
+        finishedInkIds.clear()
         isPenDown = false
         isPenActive = false
+    }
+}
+
+/**
+ * Renders the committed (persisted) handwriting strokes into [canvas]. Shared by both
+ * device pipelines so committed ink looks identical on either: the Onyx path calls this
+ * inside [InkFlushController]'s `lockCanvas` repaint bracket, the non-Onyx path calls it
+ * from [PersistedInkView.onDraw].
+ */
+internal fun drawInkStrokes(
+    canvas: Canvas,
+    strokes: Map<Pair<Int, Int>, List<List<DrawingPoint>>>,
+    strokeWidth: Float,
+) {
+    val paint = Paint().apply {
+        color = Color.BLACK
+        this.strokeWidth = strokeWidth
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        isAntiAlias = true
+    }
+    for ((_, cellStrokes) in strokes) {
+        cellStrokes.forEach { list ->
+            if (list.isNotEmpty()) {
+                val path = Path()
+                var prePoint = list[0]
+                path.moveTo(prePoint.x, prePoint.y)
+                for (i in 1 until list.size) {
+                    val point = list[i]
+                    path.quadTo(prePoint.x, prePoint.y, point.x, point.y)
+                    prePoint = point
+                }
+                canvas.drawPath(path, paint)
+            }
+        }
     }
 }

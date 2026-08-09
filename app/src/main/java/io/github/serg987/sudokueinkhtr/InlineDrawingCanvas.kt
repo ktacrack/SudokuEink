@@ -8,14 +8,24 @@ import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.util.Log
+import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
+import android.view.ViewGroup
+import android.widget.FrameLayout
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.ink.authoring.InProgressStrokeId
+import androidx.ink.authoring.InProgressStrokesFinishedListener
+import androidx.ink.authoring.InProgressStrokesView
+import androidx.ink.brush.Brush
+import androidx.ink.brush.StockBrushes
+import androidx.ink.strokes.Stroke
+import androidx.input.motionprediction.MotionEventPredictor
 import com.onyx.android.sdk.data.note.TouchPoint
 import com.onyx.android.sdk.pen.RawInputCallback
 import com.onyx.android.sdk.pen.TouchHelper
@@ -23,6 +33,9 @@ import com.onyx.android.sdk.pen.data.TouchPointList
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+
+/** Diagnostics for the non-Onyx stylus channel — mirrors NonogramEink's `NonoStylus`. */
+private const val STYLUS_TAG = "SudoStylus"
 
 @Composable
 fun InlineDrawingCanvas(
@@ -46,13 +59,28 @@ fun InlineDrawingCanvas(
 
     var paths by remember { mutableStateOf(mutableListOf<List<DrawingPoint>>()) }
     var touchHelper by remember { mutableStateOf<TouchHelper?>(null) }
-    var surfaceView by remember { mutableStateOf<SurfaceView?>(null) }
+    // Host view for both device pipelines: the Onyx SurfaceView, or the non-Onyx
+    // FrameLayout wrapping the persisted-ink view + wet-ink overlay.
+    var rootView by remember { mutableStateOf<View?>(null) }
+    // Non-Onyx only. Null (and unused) on Onyx.
+    var persistedInkView by remember { mutableStateOf<PersistedInkView?>(null) }
+    var inkOverlayView by remember { mutableStateOf<InProgressStrokesView?>(null) }
+    var motionPredictor by remember { mutableStateOf<MotionEventPredictor?>(null) }
+    var layoutListenerAttached by remember { mutableStateOf(false) }
 
     var viewWidth by remember { mutableIntStateOf(0) }
     var viewHeight by remember { mutableIntStateOf(0) }
 
     var lastStrokeTime by remember { mutableLongStateOf(0L) }
     var isErasing by remember { mutableStateOf(false) }
+
+    // ---- Non-Onyx software stylus capture state (see handleSoftwareStylusEvent below).
+    // Onyx never touches these — capture happens through TouchHelper's RawInputCallback
+    // instead.
+    var softwareStroke by remember { mutableStateOf<MutableList<DrawingPoint>?>(null) }
+    var softwareStrokeErasing by remember { mutableStateOf(false) }
+    var softwareStrokePointerId by remember { mutableIntStateOf(-1) }
+    var softwareInkStrokeId by remember { mutableStateOf<InProgressStrokeId?>(null) }
 
     // CRITICAL: We MUST use rememberUpdatedState for all lambda parameters passed to the AndroidView callbacks.
     // The AndroidView's `update` lambda only initializes the Onyx `RawInputCallback` and `onTouchListener` ONCE.
@@ -113,7 +141,8 @@ fun InlineDrawingCanvas(
     // and it is driven only by the pencil button — never mid-stroke — so it cannot race a
     // pen-down. Disabling render (plus the callback gates below) is what makes the pen inert
     // as an input device while the persisted-stroke overlay keeps rendering through the
-    // controller's own canvas draws.
+    // controller's own canvas draws. No-op on non-Onyx: touchHelper is never created there
+    // (currentPenInputEnabled is checked directly in handleSoftwareStylusEvent instead).
     LaunchedEffect(penInputEnabled, touchHelper) {
         touchHelper?.setRawDrawingRenderEnabled(penInputEnabled)
     }
@@ -122,6 +151,15 @@ fun InlineDrawingCanvas(
         onDispose {
             controller.reset()
             touchHelper?.closeRawDrawing()
+            if (!DeviceCaps.isOnyx) {
+                // A mid-stroke teardown means no ACTION_UP/CANCEL will ever arrive for an
+                // in-progress overlay stroke — cancel it explicitly (NonogramEink
+                // onHostPause parity).
+                softwareInkStrokeId?.let { id -> inkOverlayView?.cancelStroke(id) }
+                softwareStroke = null
+                softwareInkStrokeId = null
+                softwareStrokePointerId = -1
+            }
             recognizer?.close()
             onnxRecognizer?.close()
             mlKitRecognizer?.close()
@@ -222,13 +260,13 @@ fun InlineDrawingCanvas(
                         newStrokes.remove(cellKey)
                         onInkStrokesChanged(newStrokes)
 
-                        clearRunnables[cellKey]?.let { surfaceView?.removeCallbacks(it) }
+                        clearRunnables[cellKey]?.let { rootView?.removeCallbacks(it) }
                         val r = Runnable {
                             Log.d("InlineDrawingCanvas", "currentOnClearCell executing safely after debounce (gesture)")
                             currentOnClearCell(row, col)
                         }
                         clearRunnables[cellKey] = r
-                        surfaceView?.postDelayed(r, 600)
+                        rootView?.postDelayed(r, 600)
 
                         controller.scheduleFlush("eraseGestureCommit", InkFlushController.COMMIT_FLUSH_DELAY_MS)
 
@@ -280,122 +318,328 @@ fun InlineDrawingCanvas(
         }
     }
 
+    /**
+     * Non-Onyx stylus path: captures the stroke from `MotionEvent`s (with historical
+     * points, so the gesture recognizer sees the same point density the Onyx raw channel
+     * delivers) and drives the wet-ink overlay directly. Ported from NonogramEink's
+     * `handleSoftwareStylusEvent` (`NonogramGridView.kt`), adapted to Sudoku's whole-cell
+     * erase semantics (mirrors the Onyx `onBeginRawErasing`/`onEndRawErasing` pair below,
+     * rather than Nonogram's per-tile toggle).
+     *
+     * State transitions map onto the Onyx `RawInputCallback` this replaces: DOWN =
+     * `onBeginRaw*`, points accumulated per MOVE = `onRaw*TouchPointListReceived`, UP =
+     * `onEndRaw*`, CANCEL = a stroke that never produces a list callback (flush still
+     * re-armed so `isPenActive` always clears).
+     *
+     * ☠ Erase decision quirk (device-verified on this exact Teclast pen via NonogramEink):
+     * the himax driver can report a barrel button held *before* touch-down as
+     * `buttonState=0`, with the flag only appearing in the first `ACTION_MOVE` a few ms
+     * later. The erase check therefore re-runs on every MOVE as an **upgrade-only** flip
+     * (never downgraded once true) — any wet ink already drawn before the upgrade is
+     * cancelled, exactly like Onyx's raw erase channel never draws ink at all.
+     */
+    fun handleSoftwareStylusEvent(view: View, event: MotionEvent): Boolean {
+        if (!currentPenInputEnabled) return false
+
+        val toolType = event.getToolType(0)
+        if (toolType != MotionEvent.TOOL_TYPE_STYLUS && toolType != MotionEvent.TOOL_TYPE_ERASER) {
+            // Finger (or anything else): fall through so SudokuBoard's combinedClickable
+            // handles cell selection and the action-first digit/erase/notes buttons — the
+            // whole reason no TouchHelper is created on non-Onyx (see DeviceCaps doc; its
+            // undocumented fallback eats these MotionEvents).
+            return false
+        }
+
+        motionPredictor?.record(event)
+
+        val isEraserNow = toolType == MotionEvent.TOOL_TYPE_ERASER ||
+            (event.buttonState and
+                (MotionEvent.BUTTON_STYLUS_PRIMARY or MotionEvent.BUTTON_STYLUS_SECONDARY)) != 0
+
+        if (event.actionMasked != MotionEvent.ACTION_MOVE) {
+            Log.d(
+                STYLUS_TAG,
+                "action=${event.actionMasked} toolType=$toolType isEraser=$isEraserNow" +
+                    " buttonState=${event.buttonState} pressure=${event.pressure}"
+            )
+        }
+
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                controller.isPenDown = true
+                controller.isPenActive = true
+                controller.cancelPendingFlush("softStylusDown")
+
+                softwareStrokePointerId = event.getPointerId(0)
+                softwareStroke = mutableListOf(DrawingPoint(event.x, event.y, event.eventTime))
+                softwareStrokeErasing = isEraserNow
+                eraseRow = (event.y / (viewHeight / 9f)).toInt().coerceIn(0, 8)
+                eraseCol = (event.x / (viewWidth / 9f)).toInt().coerceIn(0, 8)
+
+                if (softwareStrokeErasing) {
+                    // Discard anything mid-recognition the instant we enter erase mode —
+                    // mirrors onBeginRawErasing.
+                    paths = mutableListOf()
+                    lastStrokeTime = 0L
+                } else {
+                    view.requestUnbufferedDispatch(event)
+                    val brush = Brush.createWithColorIntArgb(
+                        family = StockBrushes.pressurePen(),
+                        colorIntArgb = Color.BLACK,
+                        size = AppConfig.handwritingStrokeThickness * scaleFactor,
+                        epsilon = 0.1f
+                    )
+                    softwareInkStrokeId = inkOverlayView?.startStroke(event, softwareStrokePointerId, brush)
+                }
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (!softwareStrokeErasing && isEraserNow) {
+                    // Late-arriving button (see doc above): drop whatever wet ink was
+                    // drawn so far — Onyx's raw erase channel never draws ink either.
+                    softwareStrokeErasing = true
+                    paths = mutableListOf()
+                    lastStrokeTime = 0L
+                    softwareInkStrokeId?.let { id -> inkOverlayView?.cancelStroke(id, event) }
+                    softwareInkStrokeId = null
+                }
+                if (softwareStrokeErasing) return true
+
+                val stroke = softwareStroke ?: return true
+                val idx = event.findPointerIndex(softwareStrokePointerId)
+                if (idx < 0) return true
+                for (h in 0 until event.historySize) {
+                    stroke.add(
+                        DrawingPoint(
+                            event.getHistoricalX(idx, h),
+                            event.getHistoricalY(idx, h),
+                            event.getHistoricalEventTime(h)
+                        )
+                    )
+                }
+                stroke.add(DrawingPoint(event.getX(idx), event.getY(idx), event.eventTime))
+                softwareInkStrokeId?.let { id ->
+                    val predicted = motionPredictor?.predict()
+                    try {
+                        inkOverlayView?.addToStroke(event, softwareStrokePointerId, id, predicted)
+                    } finally {
+                        predicted?.recycle()
+                    }
+                }
+            }
+            MotionEvent.ACTION_UP -> {
+                controller.isPenDown = false
+                if (softwareStrokeErasing) {
+                    val row = eraseRow
+                    val col = eraseCol
+                    paths = mutableListOf()
+                    lastStrokeTime = 0L
+                    if (row != -1 && col != -1) {
+                        val cellKey = Pair(row, col)
+                        val newStrokes = currentInkStrokes.toMutableMap()
+                        newStrokes.remove(cellKey)
+                        onInkStrokesChanged(newStrokes)
+
+                        clearRunnables[cellKey]?.let { view.removeCallbacks(it) }
+                        val r = Runnable {
+                            Log.d("InlineDrawingCanvas", "currentOnClearCell executing safely after debounce (software eraser)")
+                            currentOnClearCell(row, col)
+                        }
+                        clearRunnables[cellKey] = r
+                        // 600ms mirrors the Onyx debounce (AGENTS.md "E-ink Hardware
+                        // Erase Conflict") for behavioral parity, even though software
+                        // erase has no hardware refresh race to wait out on LCD.
+                        view.postDelayed(r, 600)
+                    }
+                    controller.scheduleFlush("softEraserUp", InkFlushController.COMMIT_FLUSH_DELAY_MS)
+                } else {
+                    softwareInkStrokeId?.let { id -> inkOverlayView?.finishStroke(event, softwareStrokePointerId, id) }
+                    val stroke = softwareStroke
+                    if (stroke != null) {
+                        val currentPaths = paths.toMutableList()
+                        currentPaths.add(stroke)
+                        paths = currentPaths
+                        lastStrokeTime = System.currentTimeMillis()
+                    }
+                    controller.scheduleFlush("softStylusUp", InkFlushController.PEN_UP_SAFETY_DELAY_MS)
+                }
+                softwareStroke = null
+                softwareInkStrokeId = null
+                softwareStrokePointerId = -1
+                softwareStrokeErasing = false
+                eraseRow = -1
+                eraseCol = -1
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                controller.isPenDown = false
+                softwareInkStrokeId?.let { id -> inkOverlayView?.cancelStroke(id, event) }
+                softwareStroke = null
+                softwareInkStrokeId = null
+                softwareStrokePointerId = -1
+                softwareStrokeErasing = false
+                eraseRow = -1
+                eraseCol = -1
+                controller.scheduleFlush("softStylusCancel", InkFlushController.PEN_UP_SAFETY_DELAY_MS)
+            }
+        }
+        return true
+    }
+
     AndroidView(
         modifier = modifier,
         factory = { ctx ->
-            SurfaceView(ctx).apply {
-                setZOrderOnTop(true)
-                holder.setFormat(PixelFormat.TRANSPARENT)
-                holder.addCallback(object : SurfaceHolder.Callback {
-                    override fun surfaceCreated(holder: SurfaceHolder) {
-                        // Fires on first layout AND whenever the underlying Surface is torn
-                        // down and rebuilt behind our back -- e.g. backgrounding the app,
-                        // which destroys/recreates the Surface even though this SurfaceView
-                        // instance and inkStrokes are untouched. A fresh surface starts
-                        // blank, so redraw the persisted strokes immediately instead of
-                        // leaving the ink layer empty until the next stroke's flush.
-                        // MUST be the plain EPD-free redraw, NOT scheduleFlush: the repaint
-                        // bracket inside this transition wedges the scribble render channel
-                        // (no live wet ink + flashing cells) -- see redrawStrokes' doc.
-                        controller.redrawStrokes("surfaceCreated")
-                    }
-                    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
-                    override fun surfaceDestroyed(holder: SurfaceHolder) {}
-                })
-
-                setOnTouchListener { _, event ->
-                    // Pen disabled as an input device: swallow nothing, handle nothing. Return
-                    // false so the touch falls through to the Sudoku grid below (finger cell
-                    // selection keeps working) and no eraser/re-arm logic runs.
-                    if (!currentPenInputEnabled) return@setOnTouchListener false
-
-                    val toolType = event.getToolType(0)
-                    val isStylusOrEraser = toolType == android.view.MotionEvent.TOOL_TYPE_STYLUS ||
-                        toolType == android.view.MotionEvent.TOOL_TYPE_ERASER
-
-                    // Second, independent re-arm channel for the trailing flush (mirrors
-                    // NonogramEink's stranded-stroke fix): the stylus is double-dispatched
-                    // (raw SDK channel + MotionEvent both fire), so a stray ACTION_DOWN the
-                    // raw channel discards as noise could otherwise cancel a pending flush
-                    // with no onEndRaw* ever following to re-arm it. This channel re-arms
-                    // independently of RawInputCallback, guarded so it never fights a raw
-                    // stroke actually in progress.
-                    if (isStylusOrEraser) {
-                        when (event.actionMasked) {
-                            android.view.MotionEvent.ACTION_DOWN ->
-                                controller.cancelPendingFlush("stylusTouchDown")
-                            android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL ->
-                                if (!controller.isPenDown) {
-                                    controller.scheduleFlush("stylusTouchUp", InkFlushController.PEN_UP_SAFETY_DELAY_MS)
-                                }
+            Log.d(STYLUS_TAG, "InlineDrawingCanvas init: DeviceCaps.isOnyx=${DeviceCaps.isOnyx}")
+            if (DeviceCaps.isOnyx) {
+                SurfaceView(ctx).apply {
+                    setZOrderOnTop(true)
+                    holder.setFormat(PixelFormat.TRANSPARENT)
+                    holder.addCallback(object : SurfaceHolder.Callback {
+                        override fun surfaceCreated(holder: SurfaceHolder) {
+                            // Fires on first layout AND whenever the underlying Surface is torn
+                            // down and rebuilt behind our back -- e.g. backgrounding the app,
+                            // which destroys/recreates the Surface even though this SurfaceView
+                            // instance and inkStrokes are untouched. A fresh surface starts
+                            // blank, so redraw the persisted strokes immediately instead of
+                            // leaving the ink layer empty until the next stroke's flush.
+                            // MUST be the plain EPD-free redraw, NOT scheduleFlush: the repaint
+                            // bracket inside this transition wedges the scribble render channel
+                            // (no live wet ink + flashing cells) -- see redrawStrokes' doc.
+                            controller.redrawStrokes("surfaceCreated")
                         }
-                    }
+                        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
+                        override fun surfaceDestroyed(holder: SurfaceHolder) {}
+                    })
 
-                    val isEraser = toolType == android.view.MotionEvent.TOOL_TYPE_ERASER ||
-                        (toolType == android.view.MotionEvent.TOOL_TYPE_STYLUS &&
-                        (event.buttonState and android.view.MotionEvent.BUTTON_STYLUS_PRIMARY != 0 ||
-                         event.buttonState and android.view.MotionEvent.BUTTON_SECONDARY != 0))
+                    setOnTouchListener { _, event ->
+                        // Pen disabled as an input device: swallow nothing, handle nothing. Return
+                        // false so the touch falls through to the Sudoku grid below (finger cell
+                        // selection keeps working) and no eraser/re-arm logic runs.
+                        if (!currentPenInputEnabled) return@setOnTouchListener false
 
-                    Log.d("InlineDrawingCanvas", "onTouch: actionMasked=${event.actionMasked}, isEraser=$isEraser, buttonState=${event.buttonState}, toolType=${event.getToolType(0)}")
+                        val toolType = event.getToolType(0)
+                        val isStylusOrEraser = toolType == android.view.MotionEvent.TOOL_TYPE_STYLUS ||
+                            toolType == android.view.MotionEvent.TOOL_TYPE_ERASER
 
-                    if (isEraser || isErasing) {
-                        if (event.actionMasked == android.view.MotionEvent.ACTION_DOWN && isEraser) {
-                            Log.d("InlineDrawingCanvas", "onTouch ACTION_DOWN (eraser). Setting isErasing=true, clearing cell")
-                            isErasing = true
-                            paths = mutableListOf()
-                            lastStrokeTime = 0L
-
-                            val col = (event.x / (viewWidth / 9f)).toInt().coerceIn(0, 8)
-                            val row = (event.y / (viewHeight / 9f)).toInt().coerceIn(0, 8)
-                            Log.d("InlineDrawingCanvas", "onTouch ACTION_DOWN (eraser). Setting isErasing=true, clearing cell row=$row, col=$col")
-
-                            eraseRow = row
-                            eraseCol = col
-
-                            val cellKey = Pair(row, col)
-                            val newStrokes = currentInkStrokes.toMutableMap()
-                            newStrokes.remove(cellKey)
-                            onInkStrokesChanged(newStrokes)
-
-                            // We delay the onClearCell to ACTION_UP to avoid e-ink refresh conflicts
-
-                            controller.scheduleFlush("eraserTouchDown", InkFlushController.COMMIT_FLUSH_DELAY_MS)
-
-                            return@setOnTouchListener true
-                        } else if (event.actionMasked == android.view.MotionEvent.ACTION_UP || event.actionMasked == android.view.MotionEvent.ACTION_CANCEL) {
-                            Log.d("InlineDrawingCanvas", "onTouch ACTION_UP/CANCEL (eraser). Setting isErasing=false after 500ms delay")
-                            paths = mutableListOf()
-                            lastStrokeTime = 0L
-
-                            val row = if (eraseRow != -1) eraseRow else (event.y / (viewHeight / 9f)).toInt().coerceIn(0, 8)
-                            val col = if (eraseCol != -1) eraseCol else (event.x / (viewWidth / 9f)).toInt().coerceIn(0, 8)
-
-                            val cellKey = Pair(row, col)
-                            clearRunnables[cellKey]?.let { removeCallbacks(it) }
-                            val r = Runnable {
-                                Log.d("InlineDrawingCanvas", "currentOnClearCell executing safely after debounce (ACTION_UP)")
-                                // Invoking the current lambda using rememberUpdatedState to avoid stale boardState
-                                currentOnClearCell(row, col)
+                        // Second, independent re-arm channel for the trailing flush (mirrors
+                        // NonogramEink's stranded-stroke fix): the stylus is double-dispatched
+                        // (raw SDK channel + MotionEvent both fire), so a stray ACTION_DOWN the
+                        // raw channel discards as noise could otherwise cancel a pending flush
+                        // with no onEndRaw* ever following to re-arm it. This channel re-arms
+                        // independently of RawInputCallback, guarded so it never fights a raw
+                        // stroke actually in progress.
+                        if (isStylusOrEraser) {
+                            when (event.actionMasked) {
+                                android.view.MotionEvent.ACTION_DOWN ->
+                                    controller.cancelPendingFlush("stylusTouchDown")
+                                android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL ->
+                                    if (!controller.isPenDown) {
+                                        controller.scheduleFlush("stylusTouchUp", InkFlushController.PEN_UP_SAFETY_DELAY_MS)
+                                    }
                             }
-                            clearRunnables[cellKey] = r
-                            // 600ms delay ensures native e-ink hardware erase completely finishes before Android renders
-                            postDelayed(r, 600)
-                            postDelayed({ isErasing = false }, 600)
-
-                            eraseRow = -1
-                            eraseCol = -1
-                            return@setOnTouchListener true
                         }
-                    }
-                    false
-                }
 
-                surfaceView = this
-                controller.surfaceView = this
+                        val isEraser = toolType == android.view.MotionEvent.TOOL_TYPE_ERASER ||
+                            (toolType == android.view.MotionEvent.TOOL_TYPE_STYLUS &&
+                            (event.buttonState and android.view.MotionEvent.BUTTON_STYLUS_PRIMARY != 0 ||
+                             event.buttonState and android.view.MotionEvent.BUTTON_SECONDARY != 0))
+
+                        Log.d("InlineDrawingCanvas", "onTouch: actionMasked=${event.actionMasked}, isEraser=$isEraser, buttonState=${event.buttonState}, toolType=${event.getToolType(0)}")
+
+                        if (isEraser || isErasing) {
+                            if (event.actionMasked == android.view.MotionEvent.ACTION_DOWN && isEraser) {
+                                Log.d("InlineDrawingCanvas", "onTouch ACTION_DOWN (eraser). Setting isErasing=true, clearing cell")
+                                isErasing = true
+                                paths = mutableListOf()
+                                lastStrokeTime = 0L
+
+                                val col = (event.x / (viewWidth / 9f)).toInt().coerceIn(0, 8)
+                                val row = (event.y / (viewHeight / 9f)).toInt().coerceIn(0, 8)
+                                Log.d("InlineDrawingCanvas", "onTouch ACTION_DOWN (eraser). Setting isErasing=true, clearing cell row=$row, col=$col")
+
+                                eraseRow = row
+                                eraseCol = col
+
+                                val cellKey = Pair(row, col)
+                                val newStrokes = currentInkStrokes.toMutableMap()
+                                newStrokes.remove(cellKey)
+                                onInkStrokesChanged(newStrokes)
+
+                                // We delay the onClearCell to ACTION_UP to avoid e-ink refresh conflicts
+
+                                controller.scheduleFlush("eraserTouchDown", InkFlushController.COMMIT_FLUSH_DELAY_MS)
+
+                                return@setOnTouchListener true
+                            } else if (event.actionMasked == android.view.MotionEvent.ACTION_UP || event.actionMasked == android.view.MotionEvent.ACTION_CANCEL) {
+                                Log.d("InlineDrawingCanvas", "onTouch ACTION_UP/CANCEL (eraser). Setting isErasing=false after 500ms delay")
+                                paths = mutableListOf()
+                                lastStrokeTime = 0L
+
+                                val row = if (eraseRow != -1) eraseRow else (event.y / (viewHeight / 9f)).toInt().coerceIn(0, 8)
+                                val col = if (eraseCol != -1) eraseCol else (event.x / (viewWidth / 9f)).toInt().coerceIn(0, 8)
+
+                                val cellKey = Pair(row, col)
+                                clearRunnables[cellKey]?.let { removeCallbacks(it) }
+                                val r = Runnable {
+                                    Log.d("InlineDrawingCanvas", "currentOnClearCell executing safely after debounce (ACTION_UP)")
+                                    // Invoking the current lambda using rememberUpdatedState to avoid stale boardState
+                                    currentOnClearCell(row, col)
+                                }
+                                clearRunnables[cellKey] = r
+                                // 600ms delay ensures native e-ink hardware erase completely finishes before Android renders
+                                postDelayed(r, 600)
+                                postDelayed({ isErasing = false }, 600)
+
+                                eraseRow = -1
+                                eraseCol = -1
+                                return@setOnTouchListener true
+                            }
+                        }
+                        false
+                    }
+
+                    rootView = this
+                    controller.hostView = this
+                    controller.onyxSurface = this
+                }
+            } else {
+                FrameLayout(ctx).apply {
+                    val persisted = PersistedInkView(ctx).apply {
+                        strokesProvider = { currentInkStrokes }
+                        strokeWidthProvider = { AppConfig.handwritingStrokeThickness * scaleFactor }
+                    }
+                    addView(
+                        persisted,
+                        ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+                    )
+
+                    val overlay = InProgressStrokesView(ctx)
+                    overlay.eagerInit()
+                    overlay.addFinishedStrokesListener(object : InProgressStrokesFinishedListener {
+                        override fun onStrokesFinished(strokes: Map<InProgressStrokeId, Stroke>) {
+                            // UI thread. Held rendered until the trailing flush clears them
+                            // (InkFlushController.clearSoftwareInk).
+                            controller.finishedInkIds.addAll(strokes.keys)
+                        }
+                    })
+                    addView(
+                        overlay,
+                        ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+                    )
+
+                    setOnTouchListener { _, event -> handleSoftwareStylusEvent(this, event) }
+
+                    motionPredictor = MotionEventPredictor.newInstance(this)
+                    persistedInkView = persisted
+                    inkOverlayView = overlay
+                    rootView = this
+                    controller.hostView = this
+                    controller.persistedView = persisted
+                    controller.inkOverlay = overlay
+                }
             }
         },
         update = { view ->
-            if (touchHelper == null) {
+            if (!layoutListenerAttached) {
+                layoutListenerAttached = true
                 view.addOnLayoutChangeListener(object : View.OnLayoutChangeListener {
                     override fun onLayoutChange(
                         v: View, left: Int, top: Int, right: Int, bottom: Int,
@@ -404,6 +648,13 @@ fun InlineDrawingCanvas(
                         view.removeOnLayoutChangeListener(this)
                         viewWidth = right - left
                         viewHeight = bottom - top
+
+                        // No TouchHelper is ever created on non-Onyx (see DeviceCaps doc):
+                        // its undocumented fallback would consume the stylus AND finger
+                        // MotionEvents the software path (and SudokuBoard's cell taps)
+                        // depend on. handleSoftwareStylusEvent, wired in `factory` above,
+                        // is the entire non-Onyx pen pipeline.
+                        if (!DeviceCaps.isOnyx) return
 
                         val limit = Rect()
                         view.getLocalVisibleRect(limit)
@@ -466,7 +717,7 @@ fun InlineDrawingCanvas(
                                     newStrokes.remove(cellKey)
                                     onInkStrokesChanged(newStrokes)
 
-                                    clearRunnables[cellKey]?.let { surfaceView?.removeCallbacks(it) }
+                                    clearRunnables[cellKey]?.let { rootView?.removeCallbacks(it) }
                                     val r = Runnable {
                                         Log.d("InlineDrawingCanvas", "currentOnClearCell executing safely after debounce (onEndRawErasing)")
                                         // Invoking the current lambda using rememberUpdatedState to avoid stale boardState
@@ -474,11 +725,11 @@ fun InlineDrawingCanvas(
                                     }
                                     clearRunnables[cellKey] = r
                                     // 600ms delay ensures native e-ink hardware erase completely finishes before Android renders
-                                    surfaceView?.postDelayed(r, 600)
+                                    rootView?.postDelayed(r, 600)
 
                                     paths = mutableListOf()
                                     lastStrokeTime = 0L
-                                    surfaceView?.postDelayed({ isErasing = false }, 500)
+                                    rootView?.postDelayed({ isErasing = false }, 500)
                                 }
                             }
                             override fun onRawErasingTouchPointMoveReceived(touchPoint: TouchPoint) {}

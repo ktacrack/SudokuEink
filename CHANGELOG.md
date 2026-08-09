@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.2.0] - 2026-07-21
+
+### Added
+- **Non-Onyx (LCD) stylus support**, ported from NonogramEink and device-verified on a
+  Teclast Airpad Pro: no `TouchHelper` is created on non-Onyx devices (its undocumented
+  fallback ate the stylus and finger `MotionEvent`s), so wet ink is now captured from plain
+  `MotionEvent`s and rendered live with an `androidx.ink` overlay, and the action-first
+  digit/erase/notes buttons (which rely on a finger tap on a cell) work again.
+
+### Fixed
+- **Reset no longer restores a saved game's handwriting.** It was reassigning
+  `inkStrokes = initialStrokes` (the strokes loaded from the save file) instead of clearing
+  them, so after an app restart, Reset silently un-erased ink it should have wiped. Reset
+  now clears ink on both device families, matching what it already does to the board.
+- **Removed the click ripple/gray-flash** on every button and board cell app-wide — on
+  e-ink its fill sits below the refresh threshold and lingers as a ~1s ghost instead of
+  animating away.
 
 ### Changed
 - **Raw-ink flush pipeline rewritten** to stop toggling `TouchHelper.setRawDrawingEnabled`

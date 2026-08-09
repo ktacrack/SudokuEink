@@ -847,7 +847,12 @@ fun GameScreen(
                             if (!isPaused) {
                                 moveHistory.clear()
                                 inkStrokesHistory.clear()
-                                inkStrokes = initialStrokes
+                                // Reset returns to the untouched puzzle (fixed clues only),
+                                // matching what initialBoard already does to boardState below
+                                // — NOT initialStrokes, which holds the saved game's
+                                // handwriting and would silently restore it instead of
+                                // clearing it.
+                                inkStrokes = emptyMap()
                                 boardState = initialBoard.map { row -> row.map { cell -> cell.copy() } }
                                 selectedCell = null
                                 activeAction = null
@@ -1197,7 +1202,9 @@ fun GameScreen(
                         if (!isPaused) {
                             moveHistory.clear()
                             inkStrokesHistory.clear()
-                            inkStrokes = initialStrokes
+                            // See landscape Reset button above: clears ink, doesn't restore
+                            // the saved game's handwriting.
+                            inkStrokes = emptyMap()
                             boardState = initialBoard.map { row -> row.map { cell -> cell.copy() } }
                             selectedCell = null
                             activeAction = null

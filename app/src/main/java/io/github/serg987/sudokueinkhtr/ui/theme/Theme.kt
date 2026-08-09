@@ -1,8 +1,10 @@
 package io.github.serg987.sudokueinkhtr.ui.theme
 
+import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.graphics.Color
 
 // Colors optimitzats per e-ink (màxim contrast)
@@ -50,6 +52,15 @@ fun SudokuEinkTheme(
     MaterialTheme(
         colorScheme = colorScheme,
         typography = Typography,
-        content = content
-    )
+    ) {
+        // No click ripple/flash anywhere in the app — see NoIndication's doc. Covers
+        // foundation's clickable/combinedClickable/selectable/toggleable (LocalIndication)
+        // and Material3's Button/Surface (LocalRippleConfiguration).
+        CompositionLocalProvider(
+            LocalIndication provides NoIndication,
+            LocalRippleConfiguration provides null,
+        ) {
+            content()
+        }
+    }
 }
